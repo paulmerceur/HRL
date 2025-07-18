@@ -39,11 +39,20 @@ class Agent(nn.Module):
     def __init__(self, observation_space, action_space):
         super().__init__()
         
-        self.image_shape = observation_space.shape  # (H, W, 3) where 3 = (OBJECT, COLOR, STATE)
-        self.lstm_hidden_size = 128  # Restored to reasonable size
+        # Handle Dict observation space
+        if hasattr(observation_space, 'spaces'):
+            # Dict observation space
+            self.image_shape = observation_space.spaces['image'].shape  # (H, W, 3)
+            self.direction_dim = observation_space.spaces['direction'].n  # 4 directions
+        else:
+            # Legacy: Box observation space (fallback)
+            self.image_shape = observation_space.shape
+            self.direction_dim = 4
+            
+        self.lstm_hidden_size = 128
         
-        # Improved CNN - not too simple, not too complex
-        self.network = nn.Sequential(
+        # CNN for image processing
+        self.image_network = nn.Sequential(
             # Input: (batch, 3, H, W) - 3 channels for object, color, state
             nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
@@ -57,25 +66,68 @@ class Agent(nn.Module):
         # Calculate CNN output size
         with torch.no_grad():
             dummy_input = torch.zeros(1, 3, self.image_shape[0], self.image_shape[1])
-            cnn_output_size = self.network(dummy_input).shape[1]
+            cnn_output_size = self.image_network(dummy_input).shape[1]
+        
+        # Direction embedding
+        self.direction_embedding = nn.Embedding(self.direction_dim, 8)
+        
+        # Combined feature size
+        combined_feature_size = cnn_output_size + 8  # CNN features + direction embedding
         
         # RND for intrinsic motivation
-        self.rnd = RNDNetwork(cnn_output_size)
+        self.rnd = RNDNetwork(combined_feature_size)
         
-        # Lightweight LSTM for memory
-        self.lstm = nn.LSTM(cnn_output_size, self.lstm_hidden_size)
+        # LSTM for memory
+        self.lstm = nn.LSTM(combined_feature_size, self.lstm_hidden_size)
         self.actor = nn.Linear(self.lstm_hidden_size, action_space.n)
         self.critic = nn.Linear(self.lstm_hidden_size, 1)
 
+    def _process_observation(self, obs_dict):
+        """Process Dict observation into features."""
+        # Extract image and direction
+        if isinstance(obs_dict, dict):
+            image = obs_dict['image']
+            direction = obs_dict['direction']
+        else:
+            # Fallback for legacy Box observations
+            image = obs_dict
+            direction = torch.zeros(obs_dict.shape[0], dtype=torch.long, device=obs_dict.device)
+        
+        # Process image: convert to float and permute to channels-first
+        image_input = image.float().permute(0, 3, 1, 2)
+        image_features = self.image_network(image_input)
+        
+        # Process direction
+        direction_features = self.direction_embedding(direction.long())
+        
+        # Combine features
+        combined_features = torch.cat([image_features, direction_features], dim=1)
+        return combined_features
+
     def get_action_and_value(self, x, lstm_state, action=None):
-        seq_len, batch_size = x.shape[0], x.shape[1]
-        x_reshaped = x.view(seq_len * batch_size, *self.image_shape)
+        # Extract sequence length and batch size from the observation
+        if isinstance(x, dict):
+            seq_len, batch_size = x['image'].shape[0], x['image'].shape[1]
+        else:
+            seq_len, batch_size = x.shape[0], x.shape[1]
         
-        # Convert to float and permute to channels-first: (batch, channels, H, W)
-        x_input = x_reshaped.float().permute(0, 3, 1, 2)
+        # Handle Dict vs Box observations
+        if isinstance(x, dict):
+            # x is a dict observation
+            x_reshaped = {
+                'image': x['image'].view(seq_len * batch_size, *x['image'].shape[2:]),
+                'direction': x['direction'].view(seq_len * batch_size)
+            }
+        else:
+            # Legacy: x is tensor observations, convert to dict format
+            x_reshaped = x.view(seq_len * batch_size, *self.image_shape)
+            x_reshaped = {
+                'image': x_reshaped,
+                'direction': torch.zeros(seq_len * batch_size, dtype=torch.long, device=x.device)
+            }
         
-        # Process through CNN
-        features = self.network(x_input)
+        # Process observations
+        features = self._process_observation(x_reshaped)
         
         # Process through LSTM
         lstm_in = features.view(seq_len, batch_size, -1)
@@ -90,31 +142,53 @@ class Agent(nn.Module):
     
     def get_intrinsic_reward(self, x):
         """Get intrinsic reward from RND for exploration."""
-        seq_len, batch_size = x.shape[0], x.shape[1]
-        x_reshaped = x.view(seq_len * batch_size, *self.image_shape)
+        # Extract sequence length and batch size from the observation
+        if isinstance(x, dict):
+            seq_len, batch_size = x['image'].shape[0], x['image'].shape[1]
+        else:
+            seq_len, batch_size = x.shape[0], x.shape[1]
         
-        # Convert to float and permute to channels-first: (batch, channels, H, W)
-        x_input = x_reshaped.float().permute(0, 3, 1, 2)
+        # Handle Dict vs Box observations
+        if isinstance(x, dict):
+            x_reshaped = {
+                'image': x['image'].view(seq_len * batch_size, *x['image'].shape[2:]),
+                'direction': x['direction'].view(seq_len * batch_size)
+            }
+        else:
+            x_reshaped = x.view(seq_len * batch_size, *self.image_shape)
+            x_reshaped = {
+                'image': x_reshaped,
+                'direction': torch.zeros(seq_len * batch_size, dtype=torch.long, device=x.device)
+            }
         
-        # Process through CNN
-        features = self.network(x_input)
-        
-        # Get intrinsic reward
+        # Process observations and get intrinsic reward
+        features = self._process_observation(x_reshaped)
         intrinsic_reward = self.rnd.intrinsic_reward(features)
         return intrinsic_reward.view(seq_len, batch_size)
     
     def update_rnd(self, x):
         """Update RND predictor network."""
-        seq_len, batch_size = x.shape[0], x.shape[1]
-        x_reshaped = x.view(seq_len * batch_size, *self.image_shape)
+        # Extract sequence length and batch size from the observation
+        if isinstance(x, dict):
+            seq_len, batch_size = x['image'].shape[0], x['image'].shape[1]
+        else:
+            seq_len, batch_size = x.shape[0], x.shape[1]
         
-        # Convert to float and permute to channels-first: (batch, channels, H, W)
-        x_input = x_reshaped.float().permute(0, 3, 1, 2)
+        # Handle Dict vs Box observations
+        if isinstance(x, dict):
+            x_reshaped = {
+                'image': x['image'].view(seq_len * batch_size, *x['image'].shape[2:]),
+                'direction': x['direction'].view(seq_len * batch_size)
+            }
+        else:
+            x_reshaped = x.view(seq_len * batch_size, *self.image_shape)
+            x_reshaped = {
+                'image': x_reshaped,
+                'direction': torch.zeros(seq_len * batch_size, dtype=torch.long, device=x.device)
+            }
         
-        # Process through CNN
-        features = self.network(x_input)
-        
-        # Get RND loss
+        # Process observations and get RND loss
+        features = self._process_observation(x_reshaped)
         target_features, predicted_features = self.rnd(features)
         rnd_loss = torch.mean((target_features - predicted_features) ** 2)
         return rnd_loss

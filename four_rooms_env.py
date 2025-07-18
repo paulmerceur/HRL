@@ -3,16 +3,6 @@ from minigrid.wrappers import FullyObsWrapper
 from gymnasium import spaces
 
 
-class DictToBoxWrapper(gymnasium.ObservationWrapper):
-    """A standard wrapper to extract the 'image' observation from the dict."""
-    def __init__(self, env):
-        super().__init__(env)
-        assert isinstance(env.observation_space, spaces.Dict)
-        self.observation_space = env.observation_space['image']
-
-    def observation(self, obs):
-        return obs['image']
-
 def make_env(render_mode=None, max_episode_steps=512, **kwargs):
     """
     A standard environment factory function.
@@ -25,12 +15,8 @@ def make_env(render_mode=None, max_episode_steps=512, **kwargs):
     )
     env.unwrapped.max_steps = max_episode_steps # type: ignore
     
-    # Apply the observation wrappers
+    # Apply the observation wrappers - only FullyObsWrapper to keep Dict obs
     env = FullyObsWrapper(env)
-    env = DictToBoxWrapper(env)
+    # env = DictToBoxWrapper(env)  # Removed to keep full Dict observation
     
     return env 
-
-def make_env_for_vectorization(render_mode=None):
-    """Create environment for standard gymnasium vectorization."""
-    return make_env(render_mode=render_mode, max_episode_steps=512) 
